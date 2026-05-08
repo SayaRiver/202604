@@ -1,0 +1,44 @@
+networks:
+
+  nfapi_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.181.0/24
+    driver_opts:
+      com.docker.network.bridge.name: "nfapi-net"
+
+  rfsim_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.175.0/24          
+    driver_opts:
+      com.docker.network.bridge.name: "rfsim-net"
+
+  demo-oai-public-net:
+    external: true
+    
+services:
+  gnb:
+    image: ran-base:latest
+    container_name: gnb
+    tty: true
+    privileged: true
+    volumes:
+      - ./gnb:/opt/src # mount oai source code
+    working_dir: /opt/src
+    network_mode: host
+
+  ue:
+    image: ran-base:latest
+    container_name: ue
+    tty: true
+    privileged: true
+    volumes:
+      - ./ue:/opt/src # mount oai source code
+    working_dir: /opt/src
+    networks:
+      rfsim_net:
+        ipv4_address: 192.168.175.102
+    
