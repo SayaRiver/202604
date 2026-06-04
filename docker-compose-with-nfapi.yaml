@@ -21,7 +21,7 @@ networks:
     
 services:
   vnf:
-    image: ran-base:latest
+    image: ran-base:0.2
     container_name: vnf
     tty: true
     privileged: true
@@ -29,11 +29,13 @@ services:
       - ./vnf:/opt/src # mount oai source code
     working_dir: /opt/src
     networks:
+      demo-oai-public-net:
+        ipv4_address: 192.168.70.140
       nfapi_net:
         ipv4_address: 192.168.181.10
-
+  
   pnf:
-    image: ran-base:latest
+    image: ran-base:0.2
     container_name: pnf
     tty: true
     privileged: true
@@ -45,7 +47,7 @@ services:
 
 
   ue:
-    image: ran-base:latest
+    image: ran-base:0.2
     container_name: ue
     tty: true
     privileged: true
