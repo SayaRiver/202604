@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: LicenseRef-CSSL-1.0
+
+#---------------------------------------------------------------------
+#
+# Dockerfile for the Open-Air-Interface BUILD service
+#   Valid for Ubuntu 24.04
+#
+#---------------------------------------------------------------------
+
+FROM ran-base:develop AS ran-tests
+
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes && \
+    DEBIAN_FRONTEND=noninteractive apt-get install --yes \
+        libgtest-dev \
+        libyaml-cpp-dev
+
+RUN rm -Rf /oai-ran
+WORKDIR /oai-ran
+COPY . .
+
+WORKDIR /oai-ran/build
+RUN cmake -GNinja -DENABLE_TESTS=ON -DCMAKE_BUILD_TYPE=Debug -DSANITIZE_ADDRESS=True .. && ninja tests
