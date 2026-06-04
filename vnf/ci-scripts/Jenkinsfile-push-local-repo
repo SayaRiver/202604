@@ -1,0 +1,103 @@
+#!/bin/groovy
+/*
+ * SPDX-License-Identifier: LicenseRef-CSSL-1.0
+ */
+
+// Location of the python executor node shall be in the same subnet as the others servers
+def nodeExecutor = params.nodeExecutor
+
+// SSH URL of the internal git repository
+def internalRepoURL = params.internalRepoURL
+
+// Name of the resource
+def lockResources = []
+if (params.LockResources != null && params.LockResources.trim().length() > 0)
+  params.LockResources.trim().split(",").each{lockResources += [resource: it.trim()]}
+
+pipeline {
+  agent {
+    label nodeExecutor
+  }
+  options {
+    ansiColor('xterm')
+    lock(extra: lockResources)
+  }
+  stages {
+    stage('Verify parameters') {
+      steps {
+        script {
+          def missingParams = []
+          if (!params.SourceRepo?.trim())       { missingParams << 'SourceRepo' }
+          if (!params.eNB_Branch?.trim())       { missingParams << 'eNB_Branch' }
+          if (!params.eNB_CommitID?.trim())     { missingParams << 'eNB_CommitID' }
+          if (!params.eNB_TargetBranch?.trim()) { missingParams << 'eNB_TargetBranch' }
+          if (!params.eNB_Repository?.trim())   { missingParams << 'eNB_Repository' }
+
+          if (missingParams) {
+            error "Missing required parameters: ${missingParams.join(', ')}"
+          }
+
+          echo "Source Repo   : ${params.SourceRepo}"
+          echo "Source Branch : ${params.eNB_Branch}"
+          echo "Source Commit : ${params.eNB_CommitID}"
+          echo "Target Branch : ${params.eNB_TargetBranch}"
+          echo "Target Repo   : ${params.eNB_Repository}"
+        }
+      }
+    }
+    stage('Prepare workspace') {
+      steps {
+        sh """
+          git config user.email "jenkins@openairinterface.org"
+          git config user.name "OAI Jenkins"
+          git remote remove source || true
+          git remote remove internal-repo || true
+        """
+      }
+    }
+    stage('Add source repo & fetch branches') {
+      steps {
+        sh """
+          git remote add source ${params.SourceRepo} || true
+          git fetch source ${params.eNB_Branch}
+          git fetch origin ${params.eNB_TargetBranch}
+        """
+      }
+    }
+    stage('Create temporary branch for CI') {
+      steps {
+        script {
+          def shortCommit = params.eNB_CommitID.take(8)
+          env.NEW_BRANCH = "${params.eNB_Branch}-${shortCommit}"
+          echo "New branch: ${env.NEW_BRANCH}"
+        }
+        sh """
+          # Checkout source commit
+          git checkout -B ${env.NEW_BRANCH} ${params.eNB_CommitID}
+        """
+      }
+    }
+    stage('Merge target into source') {
+      steps {
+        sh """
+          echo "Merging target branch ${params.eNB_TargetBranch} into source branch ${env.NEW_BRANCH}"
+          if ! git merge --ff origin/${params.eNB_TargetBranch} \
+            -m "Merge ${params.eNB_TargetBranch} into ${params.eNB_Branch} for CI"; then
+            echo "Merge conflicts detected. Aborting."
+            git merge --abort || true
+            exit 1
+          fi
+        """
+      }
+    }
+    stage('Push merged branch to internal repository') {
+      steps {
+        sh """
+          git remote add internal-repo ${internalRepoURL} || true
+          echo "Pushing ${env.NEW_BRANCH} to internal repo"
+          git push --force internal-repo ${env.NEW_BRANCH}
+        """
+      }
+    }
+  }
+}

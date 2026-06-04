@@ -8,6 +8,14 @@ networks:
     driver_opts:
       com.docker.network.bridge.name: "nfapi-net"
 
+  nats_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.182.0/24
+    driver_opts:
+      com.docker.network.bridge.name: "nats-net"
+
   rfsim_net:
     driver: bridge
     ipam:
@@ -34,6 +42,20 @@ services:
       nfapi_net:
         ipv4_address: 192.168.181.10
   
+  proxy:
+    image: nfapi_proxy:0.1
+    container_name: proxy
+    tty: true
+    privileged: true
+    volumes:
+      - ./u-tokyo:/opt/src
+    working_dir: /opt/src
+    networks:  
+      nfapi_net:
+        ipv4_address: 192.168.181.20
+      nats_net:
+        ipv4_address: 192.168.182.20
+  
   pnf:
     image: ran-base:0.2
     container_name: pnf
@@ -43,8 +65,19 @@ services:
       - ./pnf:/opt/src # mount oai source code
     working_dir: /opt/src
     network_mode: host
-     
 
+  gnats:
+    image: gnats:0.1
+    container_name: gnats
+    tty: true
+    ports:
+      - 4222:4222
+      - 8222:8222
+    networks:
+      nats_net:
+        ipv4_address: 192.168.182.10
+    entrypoint:
+      - gnatsd
 
   ue:
     image: ran-base:0.2
