@@ -41,7 +41,7 @@ void* control_func_via_udp(void *arg)
   memset(&server_addr, 0, sizeof(server_addr));
   server_addr.sin_family = AF_INET;
   server_addr.sin_port = htons(UDP_CONTROL_SERVER_PORT);
-  inet_pton(AF_INET, "192.168.181.20", &server_addr.sin_addr);
+  inet_pton(AF_INET, "127.0.0.1", &server_addr.sin_addr);
   
   sleep(1);
   while(true){
@@ -101,12 +101,4 @@ void* control_func_via_udp(void *arg)
       }
     }
   }
-}
-
-int main()
-{
-  pthread_t p1;
-  pthread_create(&p1, NULL, control_func_via_udp, NULL);
-  pthread_join(p1, NULL);
-  return 1;
 }
