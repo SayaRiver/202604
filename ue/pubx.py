@@ -80,7 +80,7 @@ def connect_mqtt():
         else:
             print(f"Failed to connect, return code {rc}")
 
-    client = mqtt_client.Client(client_id=client_id, callback_api_version=mqtt_client.CallbackAPIVersion.VERSION2)
+    client = mqtt_client.Client(client_id=client_id)
     client.on_connect = on_connect
     try:
         client.connect(broker, port)
