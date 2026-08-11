@@ -376,6 +376,101 @@ static void log_analysis(uint16_t rnti, const ue_analysis_t *a)
 }
 
 /* ------------------------------------------------------------------------
+ * Minimal, self-contained RX_DATA_INDICATION decoder.
+ *
+ * We deliberately do NOT call the OAI-provided pack/unpack library:
+ *   - nfapi_nr_p7_message_unpack() (nfapi/src/nfapi_p7.c) has an EMPTY
+ *     nfapi/CMakeLists.txt - it is dead code, not built into libnp.a or
+ *     anything else, which is why linking against it fails.
+ *   - fapi_nr_p7_message_unpack() (fapi/src/nr_fapi_p7.c) IS actively
+ *     built, but uses a different, shorter 8-byte wire header
+ *     (fapi_message_header_t) meant for in-process FAPI, not the nFAPI SCF
+ *     transport header actually used on this P7 network link.
+ *
+ * Byte-level inspection of a real capture (nats_capture_test1_20260803.pcap,
+ * fapi.rx_data_indication messages) confirms the wire format is the
+ * 18-byte nfapi_nr_p7_message_header_t (NFAPI_NR_P7_HEADER_LENGTH) followed
+ * by sfn/slot/number_of_pdus and, per PDU, handle/rnti/harq_id/pdu_length/
+ * ul_cqi/timing_advance/rssi + payload - sfn increases monotonically across
+ * samples, slot/number_of_pdus land in sane ranges, and pdu_length matches
+ * the exact remaining byte count in every sample checked. Hand-rolling the
+ * decode for just this one message type avoids dragging in nfapi_p7.c's
+ * large, partly-dead dependency chain (assertions.h/debug.h/vendor_ext.h)
+ * for CMake targets that aren't even in libnp.a.
+ */
+#define LOCAL_RX_DATA_IND_MAX_PDU NFAPI_NR_RX_DATA_IND_MAX_PDU
+
+typedef struct {
+  uint32_t       handle;
+  uint16_t       rnti;
+  uint8_t        harq_id;
+  uint32_t       pdu_length;
+  uint8_t        ul_cqi;
+  uint16_t       timing_advance;
+  uint16_t       rssi;
+  const uint8_t *pdu;   /* points directly into the NATS message buffer, no copy */
+} local_rx_pdu_t;
+
+typedef struct {
+  uint16_t       sfn;
+  uint16_t       slot;
+  uint16_t       number_of_pdus;
+  local_rx_pdu_t pdus[LOCAL_RX_DATA_IND_MAX_PDU];
+} local_rx_data_indication_t;
+
+static uint16_t read_be16(const uint8_t *data, uint32_t *off)
+{
+  uint16_t v = ((uint16_t)data[*off] << 8) | data[*off + 1];
+  *off += 2;
+  return v;
+}
+
+static uint32_t read_be32(const uint8_t *data, uint32_t *off)
+{
+  uint32_t v = ((uint32_t)data[*off] << 24) | ((uint32_t)data[*off + 1] << 16)
+             | ((uint32_t)data[*off + 2] << 8) | (uint32_t)data[*off + 3];
+  *off += 4;
+  return v;
+}
+
+static bool unpack_rx_data_indication(const uint8_t *data, int data_len, local_rx_data_indication_t *out)
+{
+  const uint32_t hdr_len = NFAPI_NR_P7_HEADER_LENGTH;
+  if (data_len < 0 || (uint32_t)data_len < hdr_len + 6) {
+    return false;
+  }
+
+  uint32_t off = hdr_len;
+  out->sfn = read_be16(data, &off);
+  out->slot = read_be16(data, &off);
+  out->number_of_pdus = read_be16(data, &off);
+
+  if (out->number_of_pdus > LOCAL_RX_DATA_IND_MAX_PDU) {
+    return false;
+  }
+
+  for (int i = 0; i < out->number_of_pdus; i++) {
+    if (off + 16 > (uint32_t)data_len) {
+      return false;
+    }
+    local_rx_pdu_t *p = &out->pdus[i];
+    p->handle = read_be32(data, &off);
+    p->rnti = read_be16(data, &off);
+    p->harq_id = data[off]; off += 1;
+    p->pdu_length = read_be32(data, &off);
+    p->ul_cqi = data[off]; off += 1;
+    p->timing_advance = read_be16(data, &off);
+    p->rssi = read_be16(data, &off);
+    if (off + p->pdu_length > (uint32_t)data_len) {
+      return false;
+    }
+    p->pdu = data + off;
+    off += p->pdu_length;
+  }
+  return true;
+}
+
+/* ------------------------------------------------------------------------
  * NATS message handler
  * ------------------------------------------------------------------------ */
 void handle_message(natsConnection *nc, natsSubscription *sub, natsMsg *message, void *closure)
@@ -389,10 +484,7 @@ void handle_message(natsConnection *nc, natsSubscription *sub, natsMsg *message,
   }
 
   /* Header has no pointer members and is exactly NFAPI_NR_P7_HEADER_LENGTH
-   * bytes under #pragma pack(1), so an overlay cast is safe here - unlike
-   * the body types below, which contain real C pointers (pdu_list, pdu)
-   * that cannot simply be overlaid on wire bytes and must go through
-   * nfapi_nr_p7_message_unpack(). */
+   * (18) bytes under #pragma pack(1), so an overlay cast is safe here. */
   const nfapi_nr_p7_message_header_t *header = (const nfapi_nr_p7_message_header_t *)data;
   uint16_t message_id = ntohs(header->message_id);
 
@@ -401,16 +493,8 @@ void handle_message(natsConnection *nc, natsSubscription *sub, natsMsg *message,
     return;
   }
 
-  nfapi_nr_rx_data_indication_t rx_ind = {0};
-  nfapi_p7_codec_config_t codec_config = {0};
-
-  if (!nfapi_nr_p7_message_unpack((void *)data, (uint32_t)data_len, &rx_ind, sizeof(rx_ind), &codec_config)) {
-    fprintf(stderr, "Failed to unpack RX_DATA_INDICATION\n");
-    natsMsg_Destroy(message);
-    return;
-  }
-
-  if (rx_ind.number_of_pdus == 0 || rx_ind.pdu_list == NULL) {
+  local_rx_data_indication_t rx_ind;
+  if (!unpack_rx_data_indication(data, data_len, &rx_ind) || rx_ind.number_of_pdus == 0) {
     natsMsg_Destroy(message);
     return;
   }
@@ -422,7 +506,7 @@ void handle_message(natsConnection *nc, natsSubscription *sub, natsMsg *message,
   double t = now_seconds();
 
   for (int i = 0; i < rx_ind.number_of_pdus; i++) {
-    nfapi_nr_rx_data_pdu_t *pdu = &rx_ind.pdu_list[i];
+    local_rx_pdu_t *pdu = &rx_ind.pdus[i];
 
     mqtt_info_t info = parse_mqtt_from_pdu(pdu->pdu, pdu->pdu_length);
     if (info.valid) {
@@ -443,10 +527,7 @@ void handle_message(natsConnection *nc, natsSubscription *sub, natsMsg *message,
       /* SR period/window intentionally not sent yet - see TODO(sr-params)
        * above send_start_sr(). */
     }
-
-    free(pdu->pdu);
   }
-  free(rx_ind.pdu_list);
 
   natsMsg_Destroy(message);
 }
