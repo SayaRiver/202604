@@ -1,7 +1,7 @@
 import paho.mqtt.client as mqtt
 import time, json
 
-BROKER_IP = "192.168.70.139"
+BROKER_IP = "192.168.70.150"  # dedicated mqtt-broker service (docker-compose-with-nfapi.yaml)
 BROKER_PORT = 1883
 TOPIC = "iiot/ue1/sensor"
 

@@ -10,7 +10,7 @@ import string
 from paho.mqtt import client as mqtt_client
 
 # broker = '192.168.0.216'
-broker = '192.168.70.140'
+broker = '192.168.70.150'  # dedicated mqtt-broker service (docker-compose-with-nfapi.yaml), was colliding with vnf's own IP
 port = 1883
 
 # Check if a command line argument is provided

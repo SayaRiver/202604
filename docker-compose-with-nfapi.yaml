@@ -90,4 +90,13 @@ services:
     networks:
       rfsim_net:
         ipv4_address: 192.168.175.102
-    
+
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    container_name: mqtt-broker
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    networks:
+      demo-oai-public-net:
+        ipv4_address: 192.168.70.150
+
