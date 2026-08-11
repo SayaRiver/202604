@@ -1,9 +1,9 @@
 /*
- * Standalone diagnostic: subscribe to fapi.* and hex-dump raw NATS payloads,
- * decoding candidate (sfn, slot, number_of_pdus) fields under both possible
- * P7 header lengths (8-byte fapi_message_header_t vs 18-byte SCF
- * nfapi_nr_p7_message_header_t) so we can tell from real traffic which one
- * matches. No nfapi headers/libnp.a needed - build with just:
+ * Standalone diagnostic: subscribe ONLY to fapi.rx_data_indication, decode
+ * using the confirmed 18-byte nfapi_nr_p7_message_header_t (SCF) layout,
+ * and hex-dump each PDU's payload bytes directly - to check by eye whether
+ * real MQTT PUBLISH traffic is visible in plaintext inside these PDUs (vs.
+ * e.g. PDCP ciphertext). No nfapi headers/libnp.a needed - build with:
  *   gcc dump_nats.c -o dump_nats -lnats -pthread
  */
 #include <stdio.h>
@@ -15,15 +15,26 @@
 
 #define NATS_ADDR "192.168.182.10"
 #define NATS_PORT 4222
+#define NFAPI_NR_P7_HEADER_LENGTH 18
 
-static uint16_t be16(const uint8_t *p)
+static uint16_t read_be16(const uint8_t *data, uint32_t *off)
 {
-  return (uint16_t)((p[0] << 8) | p[1]);
+  uint16_t v = ((uint16_t)data[*off] << 8) | data[*off + 1];
+  *off += 2;
+  return v;
+}
+
+static uint32_t read_be32(const uint8_t *data, uint32_t *off)
+{
+  uint32_t v = ((uint32_t)data[*off] << 24) | ((uint32_t)data[*off + 1] << 16)
+             | ((uint32_t)data[*off + 2] << 8) | (uint32_t)data[*off + 3];
+  *off += 4;
+  return v;
 }
 
 static void hexdump(const uint8_t *data, int len)
 {
-  int n = len < 64 ? len : 64;
+  int n = len < 256 ? len : 256;
   for (int i = 0; i < n; i++) {
     printf("%02x ", data[i]);
     if ((i + 1) % 16 == 0) printf("\n");
@@ -32,32 +43,53 @@ static void hexdump(const uint8_t *data, int len)
   if (len > n) printf("... (%d more bytes)\n", len - n);
 }
 
+static void printable(const uint8_t *data, int len)
+{
+  int n = len < 256 ? len : 256;
+  for (int i = 0; i < n; i++) {
+    putchar((data[i] >= 32 && data[i] <= 126) ? data[i] : '.');
+  }
+  printf("\n");
+}
+
 void handle_message(natsConnection *nc, natsSubscription *sub, natsMsg *message, void *closure)
 {
   const uint8_t *data = (const uint8_t *)natsMsg_GetData(message);
   int len = natsMsg_GetDataLength(message);
-  const char *subject = natsMsg_GetSubject(message);
+
+  if (len < NFAPI_NR_P7_HEADER_LENGTH + 6) {
+    natsMsg_Destroy(message);
+    return;
+  }
+
+  uint32_t off = NFAPI_NR_P7_HEADER_LENGTH;
+  uint16_t sfn = read_be16(data, &off);
+  uint16_t slot = read_be16(data, &off);
+  uint16_t number_of_pdus = read_be16(data, &off);
 
   printf("\n================================================================\n");
-  printf("subject=%s len=%d\n", subject, len);
-  printf("raw bytes:\n");
-  hexdump(data, len);
+  printf("[%u.%u] %u PDU(s)\n", sfn, slot, number_of_pdus);
 
-  if (len >= 4) {
-    /* message_id sits at byte offset 2 in BOTH candidate header layouts,
-     * so this part alone can't disambiguate - shown for reference. */
-    printf("message_id (offset 2, both layouts agree here) = 0x%04x\n", be16(data + 2));
-  }
+  for (int i = 0; i < number_of_pdus; i++) {
+    if (off + 16 > (uint32_t)len) break;
+    uint32_t handle = read_be32(data, &off);
+    (void)handle;
+    uint16_t rnti = read_be16(data, &off);
+    uint8_t harq_id = data[off]; off += 1;
+    uint32_t pdu_length = read_be32(data, &off);
+    off += 1; /* ul_cqi */
+    off += 2; /* timing_advance */
+    off += 2; /* rssi */
 
-  if (len >= 8 + 6) {
-    printf("-- if header_len=8 (fapi_message_header_t): body starts at byte 8\n");
-    printf("   sfn=%u slot=%u number_of_pdus=%u\n",
-           be16(data + 8), be16(data + 10), be16(data + 12));
-  }
-  if (len >= 18 + 6) {
-    printf("-- if header_len=18 (nfapi_nr_p7_message_header_t / SCF): body starts at byte 18\n");
-    printf("   sfn=%u slot=%u number_of_pdus=%u\n",
-           be16(data + 18), be16(data + 20), be16(data + 22));
+    if (off + pdu_length > (uint32_t)len) break;
+
+    printf("-- PDU %d: rnti=0x%04x harq_id=%u pdu_length=%u\n", i, rnti, harq_id, pdu_length);
+    printf("   hex: ");
+    hexdump(data + off, (int)pdu_length);
+    printf("   text: ");
+    printable(data + off, (int)pdu_length);
+
+    off += pdu_length;
   }
 
   natsMsg_Destroy(message);
@@ -77,13 +109,13 @@ int main(void)
     return 1;
   }
 
-  status = natsConnection_Subscribe(&sub, nc, "fapi.*", handle_message, NULL);
+  status = natsConnection_Subscribe(&sub, nc, "fapi.rx_data_indication", handle_message, NULL);
   if (status != NATS_OK) {
     fprintf(stderr, "Failed to subscribe: %s\n", natsStatus_GetText(status));
     return 1;
   }
 
-  printf("Subscribed to fapi.* on %s, dumping raw bytes (Ctrl+C to stop)...\n", connect_str);
+  printf("Subscribed to fapi.rx_data_indication on %s, dumping PDU payloads (Ctrl+C to stop)...\n", connect_str);
   while (true) {
     sleep(100);
   }
