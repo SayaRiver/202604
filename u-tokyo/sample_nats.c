@@ -134,7 +134,11 @@ static bool find_ipv4_tcp_start(const uint8_t *data, uint32_t len, uint32_t *ip_
     uint8_t ihl = (uint8_t)(data[i] & 0x0F) * 4;
     if (ihl < 20 || i + ihl > len) continue;
     uint16_t total_len = ((uint16_t)data[i + 2] << 8) | data[i + 3];
-    if (total_len < ihl || i + total_len > len) continue; /* must fit in this PDU */
+    /* total_len may legitimately exceed what's left in this PDU - the IP
+     * packet can be the first fragment of an RLC-segmented SDU that
+     * continues in later PDUs. Don't reject on that; just don't read past
+     * ihl/tcp header bounds, checked separately below. */
+    if (total_len < ihl) continue;
     if (data[i + 9] != 6) continue;                        /* protocol == TCP */
     *ip_off = i;
     return true;
@@ -171,9 +175,14 @@ static mqtt_info_t parse_mqtt_from_pdu(const uint8_t *data, uint32_t len)
   }
 
   uint32_t mqtt_off = tcp_off + tcp_hdr_len;
-  uint32_t payload_end = ip_off + ip_total_len; /* end of this IP packet within the PDU */
-  if (mqtt_off >= payload_end || payload_end > len) {
-    return info; /* pure ACK, no TCP payload in this PDU */
+  /* End of available TCP payload bytes within *this* PDU: the IP packet
+   * may continue into later PDUs (RLC segmentation), so clip to what's
+   * actually present here rather than trusting the full declared
+   * ip_total_len, which can exceed len for a first fragment. */
+  uint32_t ip_end = ip_off + ip_total_len;
+  uint32_t payload_end = (ip_end < len) ? ip_end : len;
+  if (mqtt_off >= payload_end) {
+    return info; /* pure ACK, or no TCP payload present in this PDU */
   }
 
   uint8_t fixed_header = data[mqtt_off];
