@@ -96,14 +96,30 @@ static double now_seconds(void)
 }
 
 /* ------------------------------------------------------------------------
- * MQTT PUBLISH scan inside a MAC PDU payload.
+ * MQTT PUBLISH extraction from a MAC PDU payload.
  *
- * Ported from parse_message_from_buffer() in nfapiserver_withsend_realtime.py.
- * That version had to reassemble a segmented "userdata" table first because
- * it was reading raw NFAPI socket frames; here the payload arrives already
- * contiguous as nfapi_nr_rx_data_pdu_t.pdu, so the segment reassembly is
- * gone but the byte-scan itself (0x80 marker, +4 QoS byte, +7 topic length)
- * is kept identical to the validated Python logic.
+ * The original Python prototype (nfapiserver_withsend_realtime.py) scanned
+ * for a magic 0x80 marker byte, 4 bytes ahead of a QoS byte - that pattern
+ * was tuned to a different (non-IP) capture pipeline and does not appear
+ * anywhere in this system's actual over-the-air encapsulation.
+ *
+ * Live capture against real pubx.py traffic (RNTI 0x3cb5, 2026-08-11) shows
+ * these PDUs actually carry: [variable-length MAC subheader] [IPv4 header]
+ * [TCP header, dst port 1883] [MQTT bytes] - e.g. one captured PDU decoded
+ * to src=12.1.1.67 (the UE's own PDU session address) dst=192.168.70.150
+ * (our mqtt-broker), and another fragment's payload was plaintext
+ * "...] Current tempe..." matching pubx.py's generated message text. So
+ * instead of the magic-byte heuristic, this parses the real IPv4/TCP/MQTT
+ * framing: find the IPv4 header (no assumption on the MAC subheader length,
+ * which was observed to vary between samples - 8 and 13 bytes seen), skip
+ * IP+TCP headers using their own length fields, and read the MQTT PUBLISH
+ * fixed header (message type 0x3, QoS bits) + topic string from what's left.
+ *
+ * A single PDU only matches when it happens to contain the *start* of a
+ * PUBLISH packet (large messages get segmented across multiple PDUs by
+ * lower layers, which this does not reassemble) - continuation-only
+ * fragments legitimately won't match, which is fine since only one
+ * fragment per message needs to carry the header for QoS/topic detection.
  * ------------------------------------------------------------------------ */
 typedef struct {
   bool valid;
@@ -111,37 +127,86 @@ typedef struct {
   char topic[256];
 } mqtt_info_t;
 
+static bool find_ipv4_tcp_start(const uint8_t *data, uint32_t len, uint32_t *ip_off)
+{
+  for (uint32_t i = 0; i + 20 <= len; i++) {
+    if ((data[i] & 0xF0) != 0x40) continue;               /* IPv4 */
+    uint8_t ihl = (uint8_t)(data[i] & 0x0F) * 4;
+    if (ihl < 20 || i + ihl > len) continue;
+    uint16_t total_len = ((uint16_t)data[i + 2] << 8) | data[i + 3];
+    if (total_len < ihl || i + total_len > len) continue; /* must fit in this PDU */
+    if (data[i + 9] != 6) continue;                        /* protocol == TCP */
+    *ip_off = i;
+    return true;
+  }
+  return false;
+}
+
 static mqtt_info_t parse_mqtt_from_pdu(const uint8_t *data, uint32_t len)
 {
   mqtt_info_t info = {0};
-  if (data == NULL || len < 5) {
+  if (data == NULL || len < 20 + 20) {
     return info;
   }
 
-  int topic_len_pos = -1;
-  char qos = 0;
-  for (uint32_t i = 0; i + 4 < len; i++) {
-    if (data[i] == 0x80) {
-      if (data[i + 4] == 0x30) {
-        qos = '0';
-        topic_len_pos = (int)i + 7;
-        break;
-      } else if (data[i + 4] == 0x34) {
-        qos = '2';
-        topic_len_pos = (int)i + 7;
-        break;
-      }
-    }
-  }
-
-  if (topic_len_pos < 0 || (uint32_t)topic_len_pos >= len) {
+  uint32_t ip_off;
+  if (!find_ipv4_tcp_start(data, len, &ip_off)) {
     return info;
   }
 
-  uint8_t topic_len = data[topic_len_pos];
-  uint32_t topic_start = (uint32_t)topic_len_pos + 1;
+  uint8_t ihl = (uint8_t)(data[ip_off] & 0x0F) * 4;
+  uint16_t ip_total_len = ((uint16_t)data[ip_off + 2] << 8) | data[ip_off + 3];
+  uint32_t tcp_off = ip_off + ihl;
+
+  if (tcp_off + 20 > len) {
+    return info;
+  }
+  uint16_t dst_port = ((uint16_t)data[tcp_off + 2] << 8) | data[tcp_off + 3];
+  if (dst_port != 1883) {
+    return info; /* not MQTT */
+  }
+  uint8_t tcp_hdr_len = (uint8_t)((data[tcp_off + 12] >> 4) & 0x0F) * 4;
+  if (tcp_hdr_len < 20 || tcp_off + tcp_hdr_len > len) {
+    return info;
+  }
+
+  uint32_t mqtt_off = tcp_off + tcp_hdr_len;
+  uint32_t payload_end = ip_off + ip_total_len; /* end of this IP packet within the PDU */
+  if (mqtt_off >= payload_end || payload_end > len) {
+    return info; /* pure ACK, no TCP payload in this PDU */
+  }
+
+  uint8_t fixed_header = data[mqtt_off];
+  if ((fixed_header >> 4) != 0x3) {
+    return info; /* not a PUBLISH packet (could be a continuation fragment) */
+  }
+  uint8_t qos_bits = (fixed_header >> 1) & 0x3;
+  if (qos_bits != 0 && qos_bits != 2) {
+    return info; /* only QoS 0 / 2 are meaningful for this algorithm */
+  }
+
+  /* Remaining Length: 1-4 bytes, MQTT variable-length encoding. */
+  uint32_t pos = mqtt_off + 1;
+  uint32_t multiplier = 1;
+  uint32_t remaining_length = 0;
+  uint8_t enc_byte;
+  int enc_bytes = 0;
+  do {
+    if (pos >= payload_end || enc_bytes >= 4) return info;
+    enc_byte = data[pos++];
+    remaining_length += (uint32_t)(enc_byte & 0x7F) * multiplier;
+    multiplier *= 128;
+    enc_bytes++;
+  } while (enc_byte & 0x80);
+  (void)remaining_length;
+
+  if (pos + 2 > payload_end) {
+    return info;
+  }
+  uint16_t topic_len = ((uint16_t)data[pos] << 8) | data[pos + 1];
+  uint32_t topic_start = pos + 2;
   uint32_t topic_end = topic_start + topic_len;
-  if (topic_end > len) {
+  if (topic_end > payload_end) {
     return info;
   }
 
@@ -152,7 +217,7 @@ static mqtt_info_t parse_mqtt_from_pdu(const uint8_t *data, uint32_t len)
     }
   }
   info.topic[out] = '\0';
-  info.qos = qos;
+  info.qos = (qos_bits == 0) ? '0' : '2';
   info.valid = true;
   return info;
 }
