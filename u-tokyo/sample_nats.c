@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 #include <pthread.h>
 #include <nats/nats.h>
 #include <arpa/inet.h>
@@ -42,6 +43,7 @@ typedef struct {
   double   timestamp;   /* seconds, monotonic-ish (CLOCK_REALTIME) */
   char     qos;         /* '0' or '2' */
   uint32_t frame_len;   /* MAC PDU length in bytes */
+  char     topic[64];   /* MQTT topic, for topic-switch prediction (Algorithm 1) */
 } ue_sample_t;
 
 typedef struct ue_state {
@@ -70,11 +72,12 @@ static ue_state_t *get_or_create_ue(uint16_t rnti)
   return ue;
 }
 
-static void ue_add_sample(ue_state_t *ue, double timestamp, char qos, uint32_t frame_len)
+static void ue_add_sample(ue_state_t *ue, double timestamp, char qos, uint32_t frame_len, const char *topic)
 {
   ue->history[ue->head].timestamp = timestamp;
   ue->history[ue->head].qos = qos;
   ue->history[ue->head].frame_len = frame_len;
+  snprintf(ue->history[ue->head].topic, sizeof(ue->history[ue->head].topic), "%s", topic ? topic : "");
   ue->head = (ue->head + 1) % UE_HISTORY_CAPACITY;
   if (ue->count < UE_HISTORY_CAPACITY) {
     ue->count++;
@@ -384,6 +387,356 @@ static void analyze_ue_traffic(ue_state_t *ue, ue_analysis_t *out)
 }
 
 /* ------------------------------------------------------------------------
+ * Second algorithm, ported from analyze_ue_traffic() / "Algorithm 1 SR
+ * Window Analysis" in socketclientASR.py. Runs alongside the file1-style
+ * analyze_ue_traffic() above (both computed and logged, on the same
+ * ring-buffer window) rather than replacing it, so results can be compared
+ * side by side against the same live traffic:
+ *
+ *   - file1 (above): sr_window from raw interval spread (max-min), bsr_size
+ *     from worst-case packet size (max * 1.5) - simple, conservative.
+ *   - file2 (below): sr_window from jitter around a running period
+ *     estimate, scaled by an adaptive coefficient derived from the
+ *     coefficient of variation (CV) of that jitter; bsr_size from the
+ *     average packet size with a light 10% margin; plus burst-specific
+ *     optimized_sr_period/optimized_bsr_size, and a topic-switch-based
+ *     sr/bsr prediction independent of the interval-based estimate.
+ * ------------------------------------------------------------------------ */
+typedef struct {
+  bool   is_periodic;
+  bool   type_known;
+  double last_message_time;
+  bool   has_burst;
+
+  /* Periodic-path outputs (mirrors socketclientASR.py's "if ue_type ==
+   * Periodic and jitter_samples" branch) */
+  bool   has_jitter_stats;
+  double sr_period_ms;
+  double sr_window_ms;
+  double bsr_size;
+  double cv;
+  double alpha;
+  double sigma_jitter_ms;
+  double avg_jitter_ms;
+  double max_jitter_ms;
+  double min_jitter_ms;
+  int    jitter_samples_count;
+
+  /* Continuous-path outputs (the Python's "else" branch - also taken for
+   * Periodic classifications that had no jitter samples, matching the
+   * original's exact control flow) */
+  double min_interval_ms;
+  double max_interval_ms;
+  double median_interval_ms;
+
+  /* Burst-specific refinement, only set when has_burst && qos2 samples seen */
+  bool   burst_valid;
+  double burst_start_time;
+  double burst_end_time;
+  double burst_duration_ms;
+  int    burst_message_count;
+  double burst_interval_ms;
+  double optimized_sr_period_ms;
+  double optimized_bsr_size;
+
+  /* Topic-switch-based prediction, independent signal from the interval
+   * analysis above - only set when this RNTI's window contains at least
+   * one topic transition. */
+  bool   has_prediction;
+  double predicted_sr_ms;
+  double predicted_bsr_size;
+} ue_analysis_jitter_t;
+
+static double mean_of(const double *values, int n)
+{
+  if (n <= 0) return 0.0;
+  double sum = 0.0;
+  for (int i = 0; i < n; i++) sum += values[i];
+  return sum / n;
+}
+
+static double std_of(const double *values, int n)
+{
+  if (n <= 0) return 0.0;
+  double m = mean_of(values, n);
+  double sq = 0.0;
+  for (int i = 0; i < n; i++) {
+    double d = values[i] - m;
+    sq += d * d;
+  }
+  return sqrt(sq / n); /* population std, matching numpy.std's default ddof=0 */
+}
+
+static void analyze_ue_traffic_jitter(ue_state_t *ue, ue_analysis_jitter_t *out)
+{
+  memset(out, 0, sizeof(*out));
+  if (ue->count == 0) {
+    return;
+  }
+
+  double normal_intervals[UE_HISTORY_CAPACITY];
+  int normal_count = 0;
+  double burst_intervals[UE_HISTORY_CAPACITY];
+  int burst_interval_count = 0;
+  double jitter_samples[UE_HISTORY_CAPACITY];
+  int jitter_count = 0;
+  double packet_sizes[UE_HISTORY_CAPACITY];
+  int packet_count = 0;
+
+  double qos2_ts[UE_HISTORY_CAPACITY];
+  double qos2_len[UE_HISTORY_CAPACITY];
+  int qos2_count = 0;
+
+  bool   have_last_qos0 = false;
+  double last_qos0_time = 0.0;
+  bool   in_burst = false;
+  double mu_period = 0.0;
+  bool   have_mu_period = false;
+  double sigma_jitter = 0.0;
+
+  for (int i = 0; i < ue->count; i++) {
+    ue_sample_t *s = ue_sample_at(ue, i);
+
+    if (s->qos == '0') {
+      if (packet_count < UE_HISTORY_CAPACITY) {
+        packet_sizes[packet_count++] = s->frame_len;
+      }
+
+      if (have_last_qos0) {
+        double actual_interval = s->timestamp - last_qos0_time;
+        if (!in_burst) {
+          if (normal_count < UE_HISTORY_CAPACITY) {
+            normal_intervals[normal_count++] = actual_interval;
+          }
+          mu_period = mean_of(normal_intervals, normal_count);
+          have_mu_period = true;
+
+          double expected_time = last_qos0_time + mu_period;
+          double jitter = fabs(s->timestamp - expected_time);
+          if (jitter_count < UE_HISTORY_CAPACITY) {
+            jitter_samples[jitter_count++] = jitter;
+          }
+          if (jitter_count > 1) {
+            sigma_jitter = std_of(jitter_samples, jitter_count);
+          }
+        } else {
+          if (burst_interval_count < UE_HISTORY_CAPACITY) {
+            burst_intervals[burst_interval_count++] = actual_interval;
+          }
+          in_burst = false;
+        }
+      }
+      last_qos0_time = s->timestamp;
+      have_last_qos0 = true;
+    } else if (s->qos == '2') {
+      in_burst = true;
+      if (qos2_count < UE_HISTORY_CAPACITY) {
+        qos2_ts[qos2_count] = s->timestamp;
+        qos2_len[qos2_count] = s->frame_len;
+        qos2_count++;
+      }
+    }
+  }
+
+  double all_intervals[UE_HISTORY_CAPACITY * 2];
+  int all_count = 0;
+  for (int i = 0; i < normal_count && all_count < UE_HISTORY_CAPACITY * 2; i++) {
+    all_intervals[all_count++] = normal_intervals[i];
+  }
+  for (int i = 0; i < burst_interval_count && all_count < UE_HISTORY_CAPACITY * 2; i++) {
+    all_intervals[all_count++] = burst_intervals[i];
+  }
+
+  out->type_known = (all_count > 0);
+  if (out->type_known) {
+    double med = median_of(all_intervals, all_count);
+    out->is_periodic = (med >= 0.5);
+  }
+  out->last_message_time = ue_sample_at(ue, ue->count - 1)->timestamp;
+  out->has_burst = (burst_interval_count > 0);
+
+  if (out->is_periodic && jitter_count > 0) {
+    double cv = (have_mu_period && mu_period > 0.0) ? (sigma_jitter / mu_period) : 0.0;
+    double alpha = cv * 2.0;
+    if (alpha < 0.5) alpha = 0.5;
+    if (alpha > 3.0) alpha = 3.0;
+
+    double base_window = 0.2; /* ms */
+    double jmin = 0.0, jmax = 0.0, sr_window;
+    if (jitter_count > 1) {
+      jmin = jmax = jitter_samples[0];
+      for (int i = 1; i < jitter_count; i++) {
+        if (jitter_samples[i] < jmin) jmin = jitter_samples[i];
+        if (jitter_samples[i] > jmax) jmax = jitter_samples[i];
+      }
+      sr_window = base_window + alpha * ((jmax - jmin) * 1000.0);
+    } else {
+      sr_window = base_window;
+    }
+
+    double sr_period = mu_period * 1000.0;
+    double avg_packet_size = mean_of(packet_sizes, packet_count);
+    double bsr_size = avg_packet_size * 1.1;
+
+    out->has_jitter_stats = true;
+    out->cv = cv;
+    out->alpha = alpha;
+    out->sr_period_ms = sr_period;
+    out->sr_window_ms = sr_window;
+    out->bsr_size = bsr_size;
+    out->sigma_jitter_ms = sigma_jitter * 1000.0;
+    out->jitter_samples_count = jitter_count;
+    out->avg_jitter_ms = mean_of(jitter_samples, jitter_count) * 1000.0;
+    out->max_jitter_ms = jmax * 1000.0;
+    out->min_jitter_ms = jmin * 1000.0;
+
+    if (out->has_burst && qos2_count > 0) {
+      double b_start = qos2_ts[0], b_end = qos2_ts[0], b_max_len = qos2_len[0];
+      for (int i = 1; i < qos2_count; i++) {
+        if (qos2_ts[i] < b_start) b_start = qos2_ts[i];
+        if (qos2_ts[i] > b_end) b_end = qos2_ts[i];
+        if (qos2_len[i] > b_max_len) b_max_len = qos2_len[i];
+      }
+      out->burst_valid = true;
+      out->burst_start_time = b_start;
+      out->burst_end_time = b_end;
+      out->burst_duration_ms = (b_end - b_start) * 1000.0;
+      out->burst_message_count = qos2_count;
+
+      double burst_interval_ms = median_of(burst_intervals, burst_interval_count) * 1000.0;
+      out->burst_interval_ms = burst_interval_ms;
+
+      double optimized_sr_period;
+      if (sr_period > 0.0 && burst_interval_count > 0) {
+        double factor = burst_interval_ms / sr_period;
+        if (factor > 0.1) factor = 0.1;
+        optimized_sr_period = sr_period * factor;
+      } else {
+        optimized_sr_period = sr_period;
+      }
+      out->optimized_sr_period_ms = optimized_sr_period;
+
+      double optimized_bsr_size;
+      if (bsr_size > 0.0) {
+        optimized_bsr_size = bsr_size * (b_max_len / bsr_size);
+      } else {
+        optimized_bsr_size = b_max_len;
+      }
+      out->optimized_bsr_size = optimized_bsr_size;
+    }
+  } else {
+    /* "Continuous" path - also covers a Periodic classification that had
+     * no jitter samples, matching socketclientASR.py's control flow
+     * exactly (its else branch is reached in both cases). */
+    double min_i = 0.0, max_i = 0.0, med_i = 0.0;
+    if (all_count > 0) {
+      min_i = max_i = all_intervals[0];
+      for (int i = 1; i < all_count; i++) {
+        if (all_intervals[i] < min_i) min_i = all_intervals[i];
+        if (all_intervals[i] > max_i) max_i = all_intervals[i];
+      }
+      med_i = median_of(all_intervals, all_count);
+    }
+    double max_qos0_len = 0.0;
+    for (int i = 0; i < packet_count; i++) {
+      if (packet_sizes[i] > max_qos0_len) max_qos0_len = packet_sizes[i];
+    }
+
+    out->min_interval_ms = min_i * 1000.0;
+    out->max_interval_ms = max_i * 1000.0;
+    out->median_interval_ms = med_i * 1000.0;
+    out->sr_period_ms = med_i * 1000.0;
+    out->bsr_size = max_qos0_len * 1.5;
+  }
+}
+
+/* Topic-switch-based prediction, ported from the topic_switches loop in
+ * socketclientASR.py's analyze_data(). The Python version computed this
+ * globally across all topics/messages; per-RNTI here it means "how often
+ * does this UE switch which topic it publishes to" - only fires if a
+ * single UE/RNTI actually alternates between topics (unlikely in a setup
+ * where each pubx.py instance sticks to one topic, but implemented for
+ * when it does). Requires ue_table_mutex held by the caller (reads the
+ * ring buffer directly). */
+static void predict_from_topic_switches(ue_state_t *ue, ue_analysis_jitter_t *out)
+{
+  if (ue->count < 2) {
+    return;
+  }
+
+  double switch_intervals_ms[UE_HISTORY_CAPACITY];
+  int switch_count = 0;
+
+  for (int i = 1; i < ue->count; i++) {
+    ue_sample_t *prev = ue_sample_at(ue, i - 1);
+    ue_sample_t *cur = ue_sample_at(ue, i);
+    if (strcmp(prev->topic, cur->topic) != 0) {
+      if (switch_count < UE_HISTORY_CAPACITY) {
+        switch_intervals_ms[switch_count++] = (cur->timestamp - prev->timestamp) * 1000.0;
+      }
+    }
+  }
+
+  if (switch_count == 0) {
+    return;
+  }
+
+  int recent_count = (switch_count < 10) ? switch_count : 10;
+  double *recent = &switch_intervals_ms[switch_count - recent_count];
+
+  if (out->has_burst) {
+    double mn = recent[0];
+    for (int i = 1; i < recent_count; i++) {
+      if (recent[i] < mn) mn = recent[i];
+    }
+    out->predicted_sr_ms = mn * 0.8;
+    out->predicted_bsr_size = out->bsr_size * 2.0;
+  } else {
+    double sorted[UE_HISTORY_CAPACITY];
+    memcpy(sorted, recent, sizeof(double) * (size_t)recent_count);
+    qsort(sorted, (size_t)recent_count, sizeof(double), cmp_double);
+    int take = (recent_count < 3) ? recent_count : 3;
+    double sum = 0.0;
+    for (int i = 0; i < take; i++) sum += sorted[i];
+    /* Faithfully replicates socketclientASR.py dividing by a fixed 3
+     * (smallest_n) even when fewer than 3 switches are available, rather
+     * than by `take` - preserved as-is rather than silently "fixed". */
+    out->predicted_sr_ms = sum / 3.0;
+  }
+  out->has_prediction = true;
+}
+
+static void log_analysis_jitter(uint16_t rnti, const ue_analysis_jitter_t *a)
+{
+  printf("\n--- [Algorithm 1 / jitter-CV] UE RNTI 0x%04x ---\n", rnti);
+  printf("type: %s\n", !a->type_known ? "Unknown" : (a->is_periodic ? "Periodic" : "Continuous"));
+  printf("bsr_size: %.0f bytes\n", a->bsr_size);
+  printf("has_burst: %s\n", a->has_burst ? "true" : "false");
+  if (a->has_jitter_stats) {
+    printf("sr_period: %.3f ms, sr_window: %.3f ms\n", a->sr_period_ms, a->sr_window_ms);
+    printf("  CV: %.4f, alpha: %.4f, sigma_jitter: %.4f ms, avg_jitter: %.4f ms (min=%.4f max=%.4f, n=%d)\n",
+           a->cv, a->alpha, a->sigma_jitter_ms, a->avg_jitter_ms, a->min_jitter_ms, a->max_jitter_ms,
+           a->jitter_samples_count);
+  } else {
+    printf("min_interval: %.3f ms, max_interval: %.3f ms, median_interval: %.3f ms\n",
+           a->min_interval_ms, a->max_interval_ms, a->median_interval_ms);
+  }
+  if (a->burst_valid) {
+    printf("burst_duration: %.3f ms, burst_message_count: %d, burst_interval: %.3f ms\n",
+           a->burst_duration_ms, a->burst_message_count, a->burst_interval_ms);
+    printf("optimized_sr_period: %.3f ms, optimized_bsr_size: %.0f bytes\n",
+           a->optimized_sr_period_ms, a->optimized_bsr_size);
+  }
+  if (a->has_prediction) {
+    printf("predicted_sr: %.3f ms", a->predicted_sr_ms);
+    if (a->has_burst) {
+      printf(", predicted_bsr_size: %.0f bytes", a->predicted_bsr_size);
+    }
+    printf("\n");
+  }
+}
+
+/* ------------------------------------------------------------------------
  * UDP control channel to nfapi_proxy (see u-tokyo/sample_agent.c
  * control_func_via_udp for the receiving side / wire format reference).
  * ------------------------------------------------------------------------ */
@@ -585,17 +938,23 @@ void handle_message(natsConnection *nc, natsSubscription *sub, natsMsg *message,
     mqtt_info_t info = parse_mqtt_from_pdu(pdu->pdu, pdu->pdu_length);
     if (info.valid) {
       ue_analysis_t result;
+      ue_analysis_jitter_t result_jitter;
 
       pthread_mutex_lock(&ue_table_mutex);
       ue_state_t *ue = get_or_create_ue(pdu->rnti);
-      ue_add_sample(ue, t, info.qos, pdu->pdu_length);
+      ue_add_sample(ue, t, info.qos, pdu->pdu_length, info.topic);
       analyze_ue_traffic(ue, &result);
+      analyze_ue_traffic_jitter(ue, &result_jitter);
+      predict_from_topic_switches(ue, &result_jitter);
       pthread_mutex_unlock(&ue_table_mutex);
 
       log_analysis(pdu->rnti, &result);
+      log_analysis_jitter(pdu->rnti, &result_jitter);
 
-      /* BSR value has a well-defined wire field, send it every time we get
-       * an updated estimate. */
+      /* Actual control-channel BSR send still driven by the file1 result
+       * (already validated against live traffic) - the jitter/CV result
+       * above is computed and logged for side-by-side comparison, not
+       * wired to any output yet. */
       send_start_bsr(pdu->rnti, (uint32_t)result.bsr_size);
 
       /* SR period/window intentionally not sent yet - see TODO(sr-params)
