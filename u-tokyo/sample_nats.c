@@ -803,6 +803,87 @@ static void log_analysis(uint16_t rnti, const ue_analysis_t *a)
 }
 
 /* ------------------------------------------------------------------------
+ * CSV logging, for offline analysis (accuracy vs. known ground truth,
+ * algorithm-1-vs-algorithm-2 comparison, burst response timing - see
+ * conversation). Two files:
+ *   - sample_nats_raw.csv: every raw QoS0/QoS2 sample as it arrives.
+ *   - sample_nats_analysis.csv: one row per detected message, with both
+ *     algorithms' full output side by side for direct comparison.
+ * Opened in append mode so restarting the process doesn't clobber a
+ * previous run; header written only when the file is empty/new. Writes are
+ * flushed immediately so data isn't lost if the process is killed.
+ * Protected by ue_table_mutex (callers already hold it when logging
+ * analysis results; csv_log_raw_sample is called under the same lock).
+ * ------------------------------------------------------------------------ */
+static FILE *raw_log_file = NULL;
+static FILE *analysis_log_file = NULL;
+
+static FILE *csv_open_with_header(const char *path, const char *header)
+{
+  FILE *f = fopen(path, "a");
+  if (f == NULL) {
+    perror(path);
+    return NULL;
+  }
+  if (ftell(f) == 0) {
+    fprintf(f, "%s\n", header);
+    fflush(f);
+  }
+  return f;
+}
+
+static void csv_log_init(void)
+{
+  raw_log_file = csv_open_with_header(
+      "sample_nats_raw.csv",
+      "timestamp,rnti,qos,frame_len,topic");
+
+  analysis_log_file = csv_open_with_header(
+      "sample_nats_analysis.csv",
+      "timestamp,rnti,"
+      "alg1_type,alg1_sr_period_ms,alg1_sr_window_ms,alg1_bsr_size,alg1_has_burst,alg1_burst_duration_ms,alg1_burst_message_count,"
+      "alg2_type,alg2_sr_period_ms,alg2_sr_window_ms,alg2_bsr_size,alg2_cv,alg2_alpha,alg2_sigma_jitter_ms,alg2_avg_jitter_ms,alg2_jitter_samples_count,"
+      "alg2_has_burst,alg2_burst_duration_ms,alg2_burst_message_count,alg2_burst_interval_ms,alg2_optimized_sr_period_ms,alg2_optimized_bsr_size,"
+      "alg2_predicted_sr_ms,alg2_predicted_bsr_size");
+
+  if (raw_log_file == NULL || analysis_log_file == NULL) {
+    fprintf(stderr, "WARNING: CSV logging disabled (failed to open output file(s))\n");
+  }
+}
+
+static void csv_log_raw_sample(double timestamp, uint16_t rnti, char qos, uint32_t frame_len, const char *topic)
+{
+  if (raw_log_file == NULL) return;
+  fprintf(raw_log_file, "%.6f,0x%04x,%c,%u,\"%s\"\n", timestamp, rnti, qos, frame_len, topic ? topic : "");
+  fflush(raw_log_file);
+}
+
+static const char *ue_type_str(bool type_known, bool is_periodic)
+{
+  return !type_known ? "Unknown" : (is_periodic ? "Periodic" : "Continuous");
+}
+
+static void csv_log_analysis(double timestamp, uint16_t rnti, const ue_analysis_t *a1, const ue_analysis_jitter_t *a2)
+{
+  if (analysis_log_file == NULL) return;
+  fprintf(analysis_log_file,
+          "%.6f,0x%04x,"
+          "%s,%.3f,%.3f,%.1f,%d,%.3f,%d,"
+          "%s,%.3f,%.3f,%.1f,%.6f,%.4f,%.4f,%.4f,%d,"
+          "%d,%.3f,%d,%.3f,%.3f,%.1f,"
+          "%.3f,%.1f\n",
+          timestamp, rnti,
+          ue_type_str(a1->type_known, a1->is_periodic), a1->sr_period_ms, a1->sr_window_ms, a1->bsr_size,
+          a1->has_burst ? 1 : 0, a1->burst_duration_ms, a1->burst_message_count,
+          ue_type_str(a2->type_known, a2->is_periodic), a2->sr_period_ms, a2->sr_window_ms, a2->bsr_size,
+          a2->cv, a2->alpha, a2->sigma_jitter_ms, a2->avg_jitter_ms, a2->jitter_samples_count,
+          a2->has_burst ? 1 : 0, a2->burst_duration_ms, a2->burst_message_count, a2->burst_interval_ms,
+          a2->optimized_sr_period_ms, a2->optimized_bsr_size,
+          a2->predicted_sr_ms, a2->predicted_bsr_size);
+  fflush(analysis_log_file);
+}
+
+/* ------------------------------------------------------------------------
  * Minimal, self-contained RX_DATA_INDICATION decoder.
  *
  * We deliberately do NOT call the OAI-provided pack/unpack library:
@@ -946,6 +1027,8 @@ void handle_message(natsConnection *nc, natsSubscription *sub, natsMsg *message,
       analyze_ue_traffic(ue, &result);
       analyze_ue_traffic_jitter(ue, &result_jitter);
       predict_from_topic_switches(ue, &result_jitter);
+      csv_log_raw_sample(t, pdu->rnti, info.qos, pdu->pdu_length, info.topic);
+      csv_log_analysis(t, pdu->rnti, &result, &result_jitter);
       pthread_mutex_unlock(&ue_table_mutex);
 
       log_analysis(pdu->rnti, &result);
@@ -987,9 +1070,11 @@ int main(void)
   }
 
   control_channel_init();
+  csv_log_init();
 
   printf("Subscribed to fapi.* on %s, sending BSR updates to %s:%d\n",
          connect_str, PROXY_CONTROL_IP, PROXY_CONTROL_PORT);
+  printf("Logging to sample_nats_raw.csv and sample_nats_analysis.csv in the current directory\n");
 
   while (true) {
     sleep(100);
