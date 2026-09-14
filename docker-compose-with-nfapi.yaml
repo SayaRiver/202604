@@ -91,6 +91,18 @@ services:
       rfsim_net:
         ipv4_address: 192.168.175.102
 
+  ue2:
+    image: ran-base:0.2
+    container_name: ue2
+    tty: true
+    privileged: true
+    volumes:
+      - ./ue:/opt/src # mount oai source code
+    working_dir: /opt/src
+    networks:
+      rfsim_net:
+        ipv4_address: 192.168.175.103
+                                                                      
   mqtt-broker:
     image: eclipse-mosquitto:2
     container_name: mqtt-broker

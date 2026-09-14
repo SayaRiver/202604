@@ -1,0 +1,17 @@
+Rows total: 791
+Ground truth sr_period: 3000.0 ms
+
+alg1 (file1, median/range): n=790
+  mean error: 1.103 ms
+  std error:  0.970 ms
+  max error:  5.015 ms
+  RMSE:       1.468 ms
+
+alg2 (file2, jitter/CV): n=790
+  mean error: 0.507 ms
+  std error:  0.422 ms
+  max error:  5.015 ms
+  RMSE:       0.660 ms
+
+has_burst agreement between alg1/alg2: 99.5% of rows
+  alg1 flagged burst on 99.5% of rows, alg2 on 99.0% (a gap here is expected - see the algorithms' different has_burst definitions)
