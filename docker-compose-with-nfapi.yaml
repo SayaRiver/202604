@@ -102,7 +102,104 @@ services:
     networks:
       rfsim_net:
         ipv4_address: 192.168.175.103
-                                                                      
+
+  ue3:
+    image: ran-base:0.2
+    container_name: ue3
+    tty: true
+    privileged: true
+    volumes:
+      - ./ue:/opt/src # mount oai source code
+    working_dir: /opt/src
+    networks:
+      rfsim_net:
+        ipv4_address: 192.168.175.104
+
+  ue4:
+    image: ran-base:0.2
+    container_name: ue4
+    tty: true
+    privileged: true
+    volumes:
+      - ./ue:/opt/src # mount oai source code
+    working_dir: /opt/src
+    networks:
+      rfsim_net:
+        ipv4_address: 192.168.175.105
+
+  ue5:
+    image: ran-base:0.2
+    container_name: ue5
+    tty: true
+    privileged: true
+    volumes:
+      - ./ue:/opt/src # mount oai source code
+    working_dir: /opt/src
+    networks:
+      rfsim_net:
+        ipv4_address: 192.168.175.106
+
+  ue6:
+    image: ran-base:0.2
+    container_name: ue6
+    tty: true
+    privileged: true
+    volumes:
+      - ./ue:/opt/src # mount oai source code
+    working_dir: /opt/src
+    networks:
+      rfsim_net:
+        ipv4_address: 192.168.175.107
+
+  ue7:
+    image: ran-base:0.2
+    container_name: ue7
+    tty: true
+    privileged: true
+    volumes:
+      - ./ue:/opt/src # mount oai source code
+    working_dir: /opt/src
+    networks:
+      rfsim_net:
+        ipv4_address: 192.168.175.108
+
+  ue8:
+    image: ran-base:0.2
+    container_name: ue8
+    tty: true
+    privileged: true
+    volumes:
+      - ./ue:/opt/src # mount oai source code
+    working_dir: /opt/src
+    networks:
+      rfsim_net:
+        ipv4_address: 192.168.175.109
+
+  ue9:
+    image: ran-base:0.2
+    container_name: ue9
+    tty: true
+    privileged: true
+    volumes:
+      - ./ue:/opt/src # mount oai source code
+    working_dir: /opt/src
+    networks:
+      rfsim_net:
+        ipv4_address: 192.168.175.110
+
+  ue10:
+    image: ran-base:0.2
+    container_name: ue10
+    tty: true
+    privileged: true
+    volumes:
+      - ./ue:/opt/src # mount oai source code
+    working_dir: /opt/src
+    networks:
+      rfsim_net:
+        ipv4_address: 192.168.175.111
+
+
   mqtt-broker:
     image: eclipse-mosquitto:2
     container_name: mqtt-broker
