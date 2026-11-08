@@ -58,7 +58,7 @@ int main()
   
   pthread_t p5_p2v_server, p5_p2v_client, p5_v2p_server, p5_v2p_client;
   pthread_create(&p5_p2v_server, NULL, nfapi_p5_sc_start_p2v_server, &p5_p2v_server_option);
-  pthread_create(&p5_p2v_client, NULL, nfapi_p5_sc_start_p2v_client, &p5_p2v_server_option);
+  pthread_create(&p5_p2v_client, NULL, nfapi_p5_sc_start_p2v_client, &p5_p2v_client_option);
 
   pthread_create(&p5_v2p_server, NULL, nfapi_p5_sc_start_v2p_client, &p5_p2v_client_option);
   pthread_create(&p5_v2p_client, NULL, nfapi_p5_sc_start_v2p_client_as_server, &p5_p2v_client_option);
